@@ -374,7 +374,15 @@ void workingset_refault(struct page *page, void *shadow)
 		goto out;
 
 	SetPageActive(page);
+#ifdef CONFIG_CONT_PTE_HUGEPAGE
+	/*
+	 * NOTE: The cont_pte_nr_pages is used to support
+	 * cont-pte hugepages with intermediate states!
+	 */
+	workingset_age_nonresident(lruvec, cont_pte_nr_pages(page));
+#else
 	workingset_age_nonresident(lruvec, thp_nr_pages(page));
+#endif
 	inc_lruvec_state(lruvec, WORKINGSET_ACTIVATE_BASE + file);
 
 	/* Page was active prior to eviction */
@@ -557,7 +565,9 @@ static enum lru_status shadow_lru_isolate(struct list_head *item,
 		goto out_invalid;
 	if (WARN_ON_ONCE(node->count != node->nr_values))
 		goto out_invalid;
+#ifndef CONFIG_CONT_PTE_HUGEPAGE
 	mapping->nrexceptional -= node->nr_values;
+#endif
 	xa_delete_node(node, workingset_update_node);
 	__inc_lruvec_slab_state(node, WORKINGSET_NODERECLAIM);
 

@@ -13,6 +13,9 @@
 #include <linux/unicode.h>
 #include <linux/ioprio.h>
 #include <linux/sysfs.h>
+#ifdef CONFIG_DEVICE_XCOPY
+#include <linux/ktime.h>
+#endif
 
 #include "f2fs.h"
 #include "segment.h"
@@ -101,6 +104,61 @@ static ssize_t ovp_segments_show(struct f2fs_attr *a,
 	return sprintf(buf, "%llu\n",
 			(unsigned long long)(overprovision_segments(sbi)));
 }
+
+#ifdef CONFIG_F2FS_FASTDISCARD
+static ssize_t big_discard_blocks_show(struct f2fs_attr *a,
+		struct f2fs_sb_info *sbi, char *buf)
+{
+	struct discard_cmd_control *dcc = SM_I(sbi)->dcc_info;
+	struct list_head *pend_list;
+	struct discard_cmd *dc;
+	unsigned long big_discard_blocks = 0;
+	int i;
+
+	mutex_lock(&dcc->cmd_lock);
+	for (i = MAX_PLIST_NUM - 1; i >= (DEFAULT_DISCARD_GRANULARITY-1); i--) {
+		pend_list = &dcc->pend_list[i];
+		if (list_empty(pend_list))
+			continue;
+		list_for_each_entry(dc, pend_list, list)
+			big_discard_blocks += dc->len;
+	}
+	mutex_unlock(&dcc->cmd_lock);
+
+	return sprintf(buf, "%lu\n",big_discard_blocks);
+}
+
+static ssize_t small_discard_blocks_show(struct f2fs_attr *a,
+		struct f2fs_sb_info *sbi, char *buf)
+{
+	struct discard_cmd_control *dcc = SM_I(sbi)->dcc_info;
+	struct list_head *pend_list;
+	struct discard_cmd *dc;
+	unsigned long small_discard_blocks = 0;
+	int i;
+
+	mutex_lock(&dcc->cmd_lock);
+	for (i = 0; i < (DEFAULT_DISCARD_GRANULARITY-1); i++) {
+		pend_list = &dcc->pend_list[i];
+		if (list_empty(pend_list))
+			continue;
+		list_for_each_entry(dc, pend_list, list)
+			small_discard_blocks += dc->len;
+	}
+	mutex_unlock(&dcc->cmd_lock);
+
+	return sprintf(buf, "%lu\n",small_discard_blocks);
+}
+
+static ssize_t hw_support_fastdiscard_show(struct f2fs_attr *a,
+		struct f2fs_sb_info *sbi, char *buf)
+{
+	int hw_enable_fastdiscard = 0;
+	hw_enable_fastdiscard = f2fs_hw_support_fastdiscard(sbi);
+
+	return sprintf(buf, "%d\n",hw_enable_fastdiscard);
+}
+#endif
 
 static ssize_t lifetime_write_kbytes_show(struct f2fs_attr *a,
 		struct f2fs_sb_info *sbi, char *buf)
@@ -262,6 +320,9 @@ static ssize_t f2fs_sbi_show(struct f2fs_attr *a,
 {
 	unsigned char *ptr = NULL;
 	unsigned int *ui;
+#ifdef CONFIG_DEVICE_XCOPY
+	ktime_t *xcopy_ui;
+#endif
 
 	ptr = __struct_ptr(sbi, a->struct_type);
 	if (!ptr)
@@ -325,6 +386,53 @@ static ssize_t f2fs_sbi_show(struct f2fs_attr *a,
 	}
 
 	ui = (unsigned int *)(ptr + a->offset);
+
+#ifdef CONFIG_DEVICE_XCOPY
+	if ((!strcmp(a->attr.name, "xcopy_time_cost_max_defrag")) ||
+			(!strcmp(a->attr.name, "xcopy_time_cost_aver_defrag"))) {
+		xcopy_ui = (ktime_t *)(ptr + a->offset);
+		return sprintf(buf, "%llu\n", *xcopy_ui);
+	}
+#endif
+
+#ifdef CONFIG_F2FS_DEBUG_FASTDISCARD
+	if (!strcmp(a->attr.name, "io_aware")) {
+		bool *en_debug = (bool *)(ptr + a->offset);
+		return sprintf(buf, "%d\n", *en_debug);
+	}
+#endif
+
+#ifdef CONFIG_F2FS_FASTDISCARD
+	if (!strcmp(a->attr.name, "fastdiscard_enable")) {
+		bool *en = (bool *)(ptr + a->offset);
+		return sprintf(buf, "%d\n", *en);
+	}
+
+	if (!strcmp(a->attr.name, "screen_on")) {
+		bool *en = (bool *)(ptr + a->offset);
+		return sprintf(buf, "%d\n", *en);
+	}
+
+	if (!strcmp(a->attr.name, "discard_avgtime_us")) {
+		struct discard_cmd_control *dcc = SM_I(sbi)->dcc_info;
+		unsigned int discard_sumtime_us = dcc->discard_sumtime_us;
+		unsigned int discard_num = dcc->discard_num;
+		if (discard_sumtime_us == 0 || discard_num == 0)
+			return 0;
+		dcc->discard_avgtime_us = discard_sumtime_us/discard_num;
+		return sprintf(buf, "%u\n", dcc->discard_avgtime_us);
+	}
+
+	if (!strcmp(a->attr.name, "discard_avg_blks")) {
+		struct discard_cmd_control *dcc = SM_I(sbi)->dcc_info;
+		unsigned int period_discard_blks = dcc->period_discard_blks;
+		unsigned int cycle_count = dcc->cycle_count;
+		if (period_discard_blks == 0 || cycle_count == 0)
+			return 0;
+		dcc->discard_avg_blks= period_discard_blks/cycle_count;
+		return sprintf(buf, "%u\n", dcc->discard_avg_blks);
+	}
+#endif
 
 	return sprintf(buf, "%u\n", *ui);
 }
@@ -445,6 +553,86 @@ out:
 		return count;
 	}
 
+#ifdef CONFIG_F2FS_FASTDISCARD
+	if (!strcmp(a->attr.name, "max_fastdiscards")) {
+		if (t == 0 || t < SM_I(sbi)->dcc_info->min_fastdiscards)
+			return -EINVAL;
+		*ui = t;
+		return count;
+	}
+
+	if (!strcmp(a->attr.name, "min_fastdiscards")) {
+		if (t == 0 || t > SM_I(sbi)->dcc_info->max_fastdiscards)
+			return -EINVAL;
+		*ui = t;
+		return count;
+	}
+
+	if (!strcmp(a->attr.name, "discard_issue_bg")) {
+		if (t == 0 || t > DEF_MAX_DISCARDS_ISSUE_DPOLICY_BG)
+			return -EINVAL;
+		*ui = t;
+		return count;
+	}
+
+	if (!strcmp(a->attr.name, "discard_issue_umount")) {
+		if (t == 0 || t > DEF_DISCARDS_ISSUE_DPOLICY_UMOUNT)
+			return -EINVAL;
+		*ui = t;
+		return count;
+	}
+
+	if (!strcmp(a->attr.name, "fastdiscard_enable")) {
+		bool *en = (bool *)(ptr + a->offset);
+		*en = t;
+		return count;
+	}
+
+	if (!strcmp(a->attr.name, "screen_on")) {
+		bool *en = (bool *)(ptr + a->offset);
+		*en = t;
+		return count;
+	}
+
+	if (!strcmp(a->attr.name, "discard_avg_blks")) {
+		*ui = t;
+		if (t == 0) {
+			struct discard_cmd_control *dcc = SM_I(sbi)->dcc_info;
+			dcc->period_discard_blks = 0;
+			dcc->cycle_count = 0;
+		}
+		return count;
+	}
+
+	if (!strcmp(a->attr.name, "discard_avgtime_us")) {
+		*ui = t;
+		if (t == 0) {
+			struct discard_cmd_control *dcc = SM_I(sbi)->dcc_info;
+			dcc->discard_sumtime_us = 0;
+			dcc->discard_num = 0;
+		}
+		return count;
+	}
+
+	if (!strcmp(a->attr.name, "discard_fail_nums")) {
+		*ui = t;
+		return count;
+	}
+#endif
+
+#ifdef CONFIG_F2FS_DEBUG_FASTDISCARD
+	if (!strcmp(a->attr.name, "io_aware")) {
+		bool *en_debug = (bool *)(ptr + a->offset);
+		*en_debug = t;
+		return count;
+	}
+
+	if (!strcmp(a->attr.name, "sys_discard_granularity")) {
+		*ui = t;
+		return count;
+	}
+#endif
+
 	if (!strcmp(a->attr.name, "migration_granularity")) {
 		if (t == 0 || t > sbi->segs_per_sec)
 			return -EINVAL;
@@ -548,7 +736,13 @@ out:
 		sbi->gc_reclaimed_segs[sbi->gc_segment_mode] = 0;
 		return count;
 	}
-
+#ifdef CONFIG_DEVICE_XCOPY
+	if (!strcmp(a->attr.name, "device_copy_enable")) {
+		bool *en = (bool *)(ptr + a->offset);
+		*en = !!t;  // *en = (!!t) & (*en);
+		return count;
+	}
+#endif
 	*ui = (unsigned int)t;
 
 	return count;
@@ -680,6 +874,24 @@ F2FS_RW_ATTR(F2FS_SBI, f2fs_sb_info, gc_urgent, gc_mode);
 F2FS_RW_ATTR(SM_INFO, f2fs_sm_info, reclaim_segments, rec_prefree_segments);
 F2FS_RW_ATTR(DCC_INFO, discard_cmd_control, max_small_discards, max_discards);
 F2FS_RW_ATTR(DCC_INFO, discard_cmd_control, discard_granularity, discard_granularity);
+#ifdef CONFIG_F2FS_FASTDISCARD
+F2FS_RW_ATTR(DCC_INFO, discard_cmd_control, max_fastdiscards, max_fastdiscards);
+F2FS_RW_ATTR(DCC_INFO, discard_cmd_control, min_fastdiscards, min_fastdiscards);
+F2FS_RW_ATTR(DCC_INFO, discard_cmd_control, discard_issue_bg, discard_issue_bg);
+F2FS_RW_ATTR(DCC_INFO, discard_cmd_control, discard_issue_umount, discard_issue_umount);
+F2FS_RW_ATTR(DCC_INFO, discard_cmd_control, fastdiscard_enable, fastdiscard_enable);
+F2FS_RW_ATTR(DCC_INFO, discard_cmd_control, screen_on, screen_on);
+F2FS_RW_ATTR(DCC_INFO, discard_cmd_control, discard_avg_blks, discard_avg_blks);
+F2FS_RW_ATTR(DCC_INFO, discard_cmd_control, discard_avgtime_us, discard_avgtime_us);
+F2FS_RW_ATTR(DCC_INFO, discard_cmd_control, discard_maxtime_us, discard_maxtime_us);
+F2FS_RW_ATTR(DCC_INFO, discard_cmd_control, discard_fail_nums, discard_fail_nums);
+F2FS_RW_ATTR(DCC_INFO, discard_cmd_control, total_discard_blks, total_discard_blks);
+F2FS_RW_ATTR(DCC_INFO, discard_cmd_control, screen_on_discard_blks, screen_on_discard_blks);
+#endif
+#ifdef CONFIG_F2FS_DEBUG_FASTDISCARD
+F2FS_RW_ATTR(DCC_INFO, discard_cmd_control, io_aware, io_aware);
+F2FS_RW_ATTR(DCC_INFO, discard_cmd_control, sys_discard_granularity, sys_discard_granularity);
+#endif
 F2FS_RW_ATTR(RESERVED_BLOCKS, f2fs_sb_info, reserved_blocks, reserved_blocks);
 F2FS_RW_ATTR(SM_INFO, f2fs_sm_info, batched_trim_sections, trim_sections);
 F2FS_RW_ATTR(SM_INFO, f2fs_sm_info, ipu_policy, ipu_policy);
@@ -717,6 +929,11 @@ F2FS_RW_ATTR(CPRC_INFO, ckpt_req_control, ckpt_thread_ioprio, ckpt_thread_ioprio
 F2FS_GENERAL_RO_ATTR(dirty_segments);
 F2FS_GENERAL_RO_ATTR(free_segments);
 F2FS_GENERAL_RO_ATTR(ovp_segments);
+#ifdef CONFIG_F2FS_FASTDISCARD
+F2FS_GENERAL_RO_ATTR(small_discard_blocks);
+F2FS_GENERAL_RO_ATTR(big_discard_blocks);
+F2FS_GENERAL_RO_ATTR(hw_support_fastdiscard);
+#endif
 F2FS_GENERAL_RO_ATTR(lifetime_write_kbytes);
 F2FS_GENERAL_RO_ATTR(features);
 F2FS_GENERAL_RO_ATTR(current_reserved_blocks);
@@ -732,6 +949,14 @@ F2FS_STAT_ATTR(STAT_INFO, f2fs_stat_info, gc_foreground_calls, call_count);
 F2FS_STAT_ATTR(STAT_INFO, f2fs_stat_info, gc_background_calls, bg_gc);
 F2FS_GENERAL_RO_ATTR(moved_blocks_background);
 F2FS_GENERAL_RO_ATTR(moved_blocks_foreground);
+#ifdef CONFIG_DEVICE_XCOPY
+F2FS_RW_ATTR(STAT_INFO, f2fs_stat_info, moved_blk_defragment, xcopy_defragment_blks);
+F2FS_RW_ATTR(STAT_INFO, f2fs_stat_info, moved_xcopy_blocks, xcopy_count);
+F2FS_RW_ATTR(STAT_INFO, f2fs_stat_info, xcopy_time_snap, time_snap);
+F2FS_RW_ATTR(STAT_INFO, f2fs_stat_info, xcopy_time_cost_max_defrag, time_cost_max_defrag);
+F2FS_RW_ATTR(STAT_INFO, f2fs_stat_info, xcopy_time_cost_aver_defrag, time_cost_aver_defrag);
+F2FS_RW_ATTR(STAT_INFO, f2fs_stat_info, xcopy_total_fail_cnt, total_fail_cnt);
+#endif
 F2FS_GENERAL_RO_ATTR(avg_vblocks);
 #endif
 
@@ -777,6 +1002,9 @@ F2FS_RW_ATTR(ATGC_INFO, atgc_management, atgc_age_threshold, age_threshold);
 
 F2FS_RW_ATTR(F2FS_SBI, f2fs_sb_info, gc_segment_mode, gc_segment_mode);
 F2FS_RW_ATTR(F2FS_SBI, f2fs_sb_info, gc_reclaimed_segments, gc_reclaimed_segs);
+#ifdef CONFIG_DEVICE_XCOPY
+F2FS_RW_ATTR(F2FS_SBI, f2fs_sb_info, device_copy_enable, device_copy_enable);
+#endif
 
 #define ATTR_LIST(name) (&f2fs_attr_##name.attr)
 static struct attribute *f2fs_attrs[] = {
@@ -790,6 +1018,24 @@ static struct attribute *f2fs_attrs[] = {
 	ATTR_LIST(main_blkaddr),
 	ATTR_LIST(max_small_discards),
 	ATTR_LIST(discard_granularity),
+#ifdef CONFIG_F2FS_FASTDISCARD
+	ATTR_LIST(max_fastdiscards),
+	ATTR_LIST(min_fastdiscards),
+	ATTR_LIST(discard_issue_bg),
+	ATTR_LIST(discard_issue_umount),
+	ATTR_LIST(fastdiscard_enable),
+	ATTR_LIST(screen_on),
+	ATTR_LIST(discard_avg_blks),
+	ATTR_LIST(discard_avgtime_us),
+	ATTR_LIST(discard_maxtime_us),
+	ATTR_LIST(discard_fail_nums),
+	ATTR_LIST(total_discard_blks),
+	ATTR_LIST(screen_on_discard_blks),
+#endif
+#ifdef CONFIG_F2FS_DEBUG_FASTDISCARD
+	ATTR_LIST(io_aware),
+	ATTR_LIST(sys_discard_granularity),
+#endif
 	ATTR_LIST(pending_discard),
 	ATTR_LIST(batched_trim_sections),
 	ATTR_LIST(ipu_policy),
@@ -832,6 +1078,11 @@ static struct attribute *f2fs_attrs[] = {
 	ATTR_LIST(current_reserved_blocks),
 	ATTR_LIST(encoding),
 	ATTR_LIST(mounted_time_sec),
+#ifdef CONFIG_F2FS_FASTDISCARD
+	ATTR_LIST(small_discard_blocks),
+	ATTR_LIST(big_discard_blocks),
+	ATTR_LIST(hw_support_fastdiscard),
+#endif
 #ifdef CONFIG_F2FS_STAT_FS
 	ATTR_LIST(cp_foreground_calls),
 	ATTR_LIST(cp_background_calls),
@@ -839,6 +1090,15 @@ static struct attribute *f2fs_attrs[] = {
 	ATTR_LIST(gc_background_calls),
 	ATTR_LIST(moved_blocks_foreground),
 	ATTR_LIST(moved_blocks_background),
+#ifdef CONFIG_DEVICE_XCOPY
+	ATTR_LIST(moved_blk_defragment),
+	ATTR_LIST(moved_xcopy_blocks),
+	ATTR_LIST(xcopy_time_snap),
+	ATTR_LIST(xcopy_time_cost_max_defrag),
+	ATTR_LIST(xcopy_time_cost_aver_defrag),
+	ATTR_LIST(xcopy_total_fail_cnt),
+	ATTR_LIST(device_copy_enable),
+#endif
 	ATTR_LIST(avg_vblocks),
 #endif
 #ifdef CONFIG_F2FS_FS_COMPRESSION
@@ -1194,6 +1454,83 @@ static int __maybe_unused victim_bits_seq_show(struct seq_file *seq,
 	return 0;
 }
 
+#ifdef CONFIG_F2FS_DEBUG_FASTDISCARD
+static int __maybe_unused discard_info_seq_show(struct seq_file *seq,
+						void *offset)
+{
+	struct super_block *sb = seq->private;
+	struct f2fs_sb_info *sbi = F2FS_SB(sb);
+	struct discard_cmd_control *dcc = SM_I(sbi)->dcc_info;
+	struct list_head *pend_list;
+	struct discard_cmd *dc;
+	unsigned long small_discard_blocks = 0;
+	unsigned long big_discard_blocks = 0;
+	unsigned int small_discard_quantity = 0;
+	unsigned int big_discard_quantity = 0;
+	int i;
+	bool fastdiscard_enable = false;
+
+	fastdiscard_enable = f2fs_support_fastdiscard(sbi);
+
+	seq_puts(seq, "[DISCARD_INFO]\n");
+
+	mutex_lock(&dcc->cmd_lock);
+	for (i = MAX_PLIST_NUM - 1; i >= 0; i--) {
+		pend_list = &dcc->pend_list[i];
+		if (list_empty(pend_list))
+			continue;
+		list_for_each_entry(dc, pend_list, list) {
+			if (i >= DEFAULT_DISCARD_GRANULARITY-1) {
+				big_discard_blocks += dc->len;
+				big_discard_quantity++;
+			} else {
+				small_discard_blocks += dc->len;
+				small_discard_quantity++;
+			}
+		}
+	}
+	mutex_unlock(&dcc->cmd_lock);
+
+	seq_printf(seq, "small_discard_blocks:	%lu\n",
+				small_discard_blocks);
+	seq_printf(seq, "small_discard_quantity:	%u\n",
+				small_discard_quantity);
+	seq_printf(seq, "big_discard_blocks:	%lu\n",
+				big_discard_blocks);
+	seq_printf(seq, "big_discard_quantity:	%u\n",
+				big_discard_quantity);
+
+	seq_putc(seq, '\n');
+
+	if(fastdiscard_enable) {
+		seq_puts(seq, "[DPOLICY_BG]\n");
+		seq_printf(seq, "small_discard_issues:	%d\n",
+					dcc->discard_issue_bg);
+		seq_printf(seq, "big_discard_issues:	%d\n",
+					DEF_MAX_DISCARD_REQUEST);
+
+		seq_puts(seq, "[DPOLICY_UMOUNT]\n");
+		seq_printf(seq, "small_discard_issues:	%d\n",
+					dcc->discard_issue_umount);
+		seq_printf(seq, "big_discard_issues:	%d\n",
+					dcc->discard_issue_umount);
+	}else {
+		seq_puts(seq, "[DPOLICY_BG]\n");
+		seq_printf(seq, "small_discard_issues:	%d\n",
+					DEF_MAX_DISCARD_REQUEST);
+		seq_printf(seq, "big_discard_issues:	%d\n",
+					DEF_MAX_DISCARD_REQUEST);
+
+		seq_puts(seq, "[DPOLICY_UMOUNT]\n");
+		seq_printf(seq, "small_discard_issues:	%d\n",
+					DEF_MAX_DISCARD_REQUEST);
+		seq_printf(seq, "big_discard_issues:	%d\n",
+					DEF_MAX_DISCARD_REQUEST);
+	}
+	return 0;
+}
+#endif
+
 int __init f2fs_init_sysfs(void)
 {
 	int ret;
@@ -1262,6 +1599,11 @@ int f2fs_register_sysfs(struct f2fs_sb_info *sbi)
 				iostat_info_seq_show, sb);
 		proc_create_single_data("victim_bits", S_IRUGO, sbi->s_proc,
 				victim_bits_seq_show, sb);
+#ifdef CONFIG_F2FS_DEBUG_FASTDISCARD
+		proc_create_single_data("fastdiscard_info", S_IRUGO, sbi->s_proc,
+				discard_info_seq_show, sb);
+#endif
+
 	}
 	return 0;
 put_feature_list_kobj:
@@ -1283,6 +1625,9 @@ void f2fs_unregister_sysfs(struct f2fs_sb_info *sbi)
 		remove_proc_entry("segment_info", sbi->s_proc);
 		remove_proc_entry("segment_bits", sbi->s_proc);
 		remove_proc_entry("victim_bits", sbi->s_proc);
+#ifdef CONFIG_F2FS_DEBUG_FASTDISCARD
+		remove_proc_entry("fastdiscard_info",sbi->s_proc);
+#endif
 		remove_proc_entry(sbi->sb->s_id, f2fs_proc_root);
 	}
 

@@ -218,7 +218,7 @@ out:
 	return ret;
 }
 
-static void dwc3_ep0_stall_and_restart(struct dwc3 *dwc)
+void dwc3_ep0_stall_and_restart(struct dwc3 *dwc)
 {
 	struct dwc3_ep		*dep;
 
@@ -382,7 +382,9 @@ static int dwc3_ep0_handle_status(struct dwc3 *dwc,
 	dwc->ep0_usb_req.request.length = sizeof(*response_pkt);
 	dwc->ep0_usb_req.request.buf = dwc->setup_buf;
 	dwc->ep0_usb_req.request.complete = dwc3_ep0_status_cmpl;
-
+#ifdef OPLUS_FEATURE_CHG_BASIC
+	dwc->ep0_usb_req.request.dma = DMA_MAPPING_ERROR;
+#endif
 	return __dwc3_gadget_ep0_queue(dep, &dwc->ep0_usb_req);
 }
 
@@ -750,7 +752,9 @@ static int dwc3_ep0_set_sel(struct dwc3 *dwc, struct usb_ctrlrequest *ctrl)
 	dwc->ep0_usb_req.request.length = dep->endpoint.maxpacket;
 	dwc->ep0_usb_req.request.buf = dwc->setup_buf;
 	dwc->ep0_usb_req.request.complete = dwc3_ep0_set_sel_cmpl;
-
+#ifdef OPLUS_FEATURE_CHG_BASIC
+	dwc->ep0_usb_req.request.dma = DMA_MAPPING_ERROR;
+#endif
 	return __dwc3_gadget_ep0_queue(dep, &dwc->ep0_usb_req);
 }
 
@@ -1087,13 +1091,18 @@ void dwc3_ep0_send_delayed_status(struct dwc3 *dwc)
 	__dwc3_ep0_do_control_status(dwc, dwc->eps[direction]);
 }
 
-static void dwc3_ep0_end_control_data(struct dwc3 *dwc, struct dwc3_ep *dep)
+void dwc3_ep0_end_control_data(struct dwc3 *dwc, struct dwc3_ep *dep)
 {
 	struct dwc3_gadget_ep_cmd_params params;
 	u32			cmd;
 	int			ret;
 
-	if (!dep->resource_index)
+	/*
+	 * For status/DATA OUT stage, TRB will be queued on ep0 out
+	 * endpoint for which resource index is zero. Hence allow
+	 * queuing ENDXFER command for ep0 out endpoint.
+	 */
+	if (!dep->resource_index && dep->number)
 		return;
 
 	cmd = DWC3_DEPCMD_ENDTRANSFER;

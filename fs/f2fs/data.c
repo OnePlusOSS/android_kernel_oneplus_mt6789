@@ -33,7 +33,11 @@
 static struct kmem_cache *bio_post_read_ctx_cache;
 static struct kmem_cache *bio_entry_slab;
 static mempool_t *bio_post_read_ctx_pool;
+#ifdef CONFIG_DEVICE_XCOPY
+struct bio_set f2fs_bioset;
+#else
 static struct bio_set f2fs_bioset;
+#endif
 
 #define	F2FS_BIO_POOL_SIZE	NR_CURSEG_TYPE
 
@@ -50,7 +54,11 @@ void f2fs_destroy_bioset(void)
 	bioset_exit(&f2fs_bioset);
 }
 
+#ifdef CONFIG_DEVICE_XCOPY
+bool __is_cp_guaranteed(struct page *page)
+#else
 static bool __is_cp_guaranteed(struct page *page)
+#endif
 {
 	struct address_space *mapping = page->mapping;
 	struct inode *inode;
@@ -132,11 +140,27 @@ static void f2fs_finish_read_bio(struct bio *bio)
 		struct page *page = bv->bv_page;
 
 		if (f2fs_is_compressed_page(page)) {
+#ifdef CONFIG_CONT_PTE_HUGEPAGE
+			/*NOTE: This scenario does not support PageCont!*/
+			BUG_ON(PageCont(page));
+#endif
 			if (bio->bi_status)
 				f2fs_end_read_compressed_page(page, true, 0);
 			f2fs_put_page_dic(page);
 			continue;
 		}
+
+#ifdef CONFIG_CONT_PTE_HUGEPAGE
+		if (PageCont(page)) {
+			if (bio->bi_status || PageError(page)) {
+				ClearPageUptodate(page);
+				SetPageError(page);
+			}
+
+			set_cont_pte_uptodate_and_unlock(page);
+			continue;
+		}
+#endif
 
 		/* PG_error was set if decryption or verity failed. */
 		if (bio->bi_status || PageError(page)) {
@@ -311,7 +335,8 @@ static void f2fs_write_end_io(struct bio *bio)
 			mempool_free(page, sbi->write_io_dummy);
 
 			if (unlikely(bio->bi_status))
-				f2fs_stop_checkpoint(sbi, true);
+				f2fs_stop_checkpoint(sbi, true,
+						STOP_CP_REASON_WRITE_FAIL);
 			continue;
 		}
 
@@ -327,7 +352,8 @@ static void f2fs_write_end_io(struct bio *bio)
 		if (unlikely(bio->bi_status)) {
 			mapping_set_error(page->mapping, -EIO);
 			if (type == F2FS_WB_CP_DATA)
-				f2fs_stop_checkpoint(sbi, true);
+				f2fs_stop_checkpoint(sbi, true,
+						STOP_CP_REASON_WRITE_FAIL);
 		}
 
 		f2fs_bug_on(sbi, page->mapping == NODE_MAPPING(sbi) &&
@@ -496,6 +522,51 @@ submit_io:
 		trace_f2fs_submit_write_bio(sbi->sb, type, bio);
 	submit_bio(bio);
 }
+
+#ifdef CONFIG_DEVICE_XCOPY
+void f2fs_copy_end_io(struct bio *bio)
+{
+	struct blk_copy_payload *payload = bio->bi_private;
+	struct page *page = payload->pages[0];
+	struct f2fs_sb_info *sbi = F2FS_P_SB(page);
+	struct inode *inode;
+	enum count_type type;
+	int i;
+
+	if (time_to_inject(sbi, FAULT_XCOPY_ENDIO)) {
+		f2fs_show_injection_info(sbi, FAULT_XCOPY_ENDIO);
+		bio->bi_status = BLK_STS_IOERR;
+	}
+
+	if (unlikely(bio->bi_status))
+		stat_inc_xcopy_total_fail(sbi->stat_info);
+
+	for (i = 0; i < BLK_MAX_COPY_RANGE; i++) {
+		page = payload->pages[i];
+		if (!page)
+			continue;
+
+		type = WB_DATA_TYPE(page);
+		if (unlikely(bio->bi_status)) {
+			mapping_set_error(page->mapping, -EIO);
+			if (type == F2FS_WB_CP_DATA) {
+				f2fs_stop_checkpoint(sbi, true, STOP_CP_REASON_WRITE_FAIL);
+			}
+		}
+
+		inode = page->mapping->host;
+		dec_page_count(sbi, type);
+		clear_page_private_gcing(page);
+		end_page_writeback(page);
+		f2fs_put_page(page, 1);
+		f2fs_bug_on(sbi, atomic_dec_return(&F2FS_I(inode)->file_xcopy_cnt) < 0);
+	}
+
+	kvfree(payload);
+	bio->bi_private = NULL;
+	bio_put(bio);
+}
+#endif
 
 void f2fs_submit_bio(struct f2fs_sb_info *sbi,
 				struct bio *bio, enum page_type type)
@@ -1344,7 +1415,11 @@ got_it:
 	return page;
 }
 
+#ifdef CONFIG_DEVICE_XCOPY
+int __allocate_data_block(struct dnode_of_data *dn, int seg_type)
+#else
 static int __allocate_data_block(struct dnode_of_data *dn, int seg_type)
+#endif
 {
 	struct f2fs_sb_info *sbi = F2FS_I_SB(dn->inode);
 	struct f2fs_summary sum;
@@ -2479,6 +2554,9 @@ static inline bool check_inplace_update_policy(struct inode *inode,
 	struct f2fs_sb_info *sbi = F2FS_I_SB(inode);
 	unsigned int policy = SM_I(sbi)->ipu_policy;
 
+	if (policy & (0x1 << F2FS_IPU_HONOR_OPU_WRITE) &&
+			is_inode_flag_set(inode, FI_OPU_WRITE))
+		return false;
 	if (policy & (0x1 << F2FS_IPU_FORCE))
 		return true;
 	if (policy & (0x1 << F2FS_IPU_SSR) && f2fs_need_SSR(sbi))
@@ -2521,7 +2599,7 @@ bool f2fs_should_update_inplace(struct inode *inode, struct f2fs_io_info *fio)
 		return true;
 
 	/* if this is cold file, we should overwrite to avoid fragmentation */
-	if (file_is_cold(inode))
+	if (file_is_cold(inode) && !is_inode_flag_set(inode, FI_OPU_WRITE))
 		return true;
 
 	return check_inplace_update_policy(inode, fio);
@@ -2544,9 +2622,13 @@ bool f2fs_should_update_outplace(struct inode *inode, struct f2fs_io_info *fio)
 		return true;
 	if (f2fs_is_atomic_file(inode))
 		return true;
-
+	if (is_inode_flag_set(inode, FI_OPU_WRITE))
+		return true;
 	/* swap file is migrating in aligned write mode */
 	if (is_inode_flag_set(inode, FI_ALIGNED_WRITE))
+		return true;
+
+	if (is_inode_flag_set(inode, FI_OPU_WRITE))
 		return true;
 
 	if (fio) {
@@ -2714,6 +2796,7 @@ int f2fs_write_single_data_page(struct page *page, int *submitted,
 		.submitted = false,
 		.compr_blocks = compr_blocks,
 		.need_lock = LOCK_RETRY,
+		.post_read = f2fs_post_read_required(inode),
 		.io_type = io_type,
 		.io_wbc = wbc,
 		.bio = bio,
@@ -3172,8 +3255,8 @@ static int __f2fs_write_data_pages(struct address_space *mapping,
 			f2fs_available_free_memory(sbi, DIRTY_DENTS))
 		goto skip_write;
 
-	/* skip writing during file defragment */
-	if (is_inode_flag_set(inode, FI_DO_DEFRAG))
+	/* skip writing in file defragment preparing stage */
+	if (is_inode_flag_set(inode, FI_SKIP_WRITES))
 		goto skip_write;
 
 	trace_f2fs_writepages(mapping->host, wbc, DATA);
@@ -3786,8 +3869,14 @@ static int f2fs_set_data_page_dirty(struct page *page)
 
 	trace_f2fs_set_page_dirty(page, DATA);
 
+#ifdef CONFIG_DEVICE_XCOPY
+	if (!PageUptodate(page) && !page_private_xcopy(page))
+		SetPageUptodate(page);
+#else
 	if (!PageUptodate(page))
 		SetPageUptodate(page);
+#endif
+
 	if (PageSwapCache(page))
 		return __set_page_dirty_nobuffers(page);
 
@@ -3955,6 +4044,7 @@ static int f2fs_migrate_blocks(struct inode *inode, block_t start_blk,
 	f2fs_down_write(&F2FS_I(inode)->i_mmap_sem);
 
 	set_inode_flag(inode, FI_ALIGNED_WRITE);
+	set_inode_flag(inode, FI_OPU_WRITE);
 
 	for (; secidx < end_sec; secidx++) {
 		f2fs_down_write(&sbi->pin_sem);
@@ -3963,7 +4053,7 @@ static int f2fs_migrate_blocks(struct inode *inode, block_t start_blk,
 		f2fs_allocate_new_section(sbi, CURSEG_COLD_DATA_PINNED, false);
 		f2fs_unlock_op(sbi);
 
-		set_inode_flag(inode, FI_DO_DEFRAG);
+		set_inode_flag(inode, FI_SKIP_WRITES);
 
 		for (blkofs = 0; blkofs < blk_per_sec; blkofs++) {
 			struct page *page;
@@ -3980,7 +4070,7 @@ static int f2fs_migrate_blocks(struct inode *inode, block_t start_blk,
 			f2fs_put_page(page, 1);
 		}
 
-		clear_inode_flag(inode, FI_DO_DEFRAG);
+		clear_inode_flag(inode, FI_SKIP_WRITES);
 
 		ret = filemap_fdatawrite(inode->i_mapping);
 
@@ -3991,7 +4081,8 @@ static int f2fs_migrate_blocks(struct inode *inode, block_t start_blk,
 	}
 
 done:
-	clear_inode_flag(inode, FI_DO_DEFRAG);
+	clear_inode_flag(inode, FI_SKIP_WRITES);
+	clear_inode_flag(inode, FI_OPU_WRITE);
 	clear_inode_flag(inode, FI_ALIGNED_WRITE);
 
 	f2fs_up_write(&F2FS_I(inode)->i_mmap_sem);

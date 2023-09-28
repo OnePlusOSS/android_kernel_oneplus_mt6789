@@ -56,6 +56,10 @@ const char *f2fs_fault_name[FAULT_MAX] = {
 	[FAULT_CHECKPOINT]	= "checkpoint error",
 	[FAULT_DISCARD]		= "discard error",
 	[FAULT_WRITE_IO]	= "write IO error",
+#ifdef CONFIG_DEVICE_XCOPY
+	[FAULT_DEVICE_XCOPY] = "xcopy payload null",
+	[FAULT_XCOPY_ENDIO] = "xcopy io error",
+#endif
 };
 
 void f2fs_build_fault_attr(struct f2fs_sb_info *sbi, unsigned int rate,
@@ -152,6 +156,10 @@ enum {
 	Opt_compress_mode,
 	Opt_compress_cache,
 	Opt_atgc,
+#ifdef CONFIG_DEVICE_XCOPY
+	Opt_device_copy,
+	Opt_no_device_copy,
+#endif
 	Opt_gc_merge,
 	Opt_nogc_merge,
 	Opt_err,
@@ -227,6 +235,10 @@ static match_table_t f2fs_tokens = {
 	{Opt_compress_mode, "compress_mode=%s"},
 	{Opt_compress_cache, "compress_cache"},
 	{Opt_atgc, "atgc"},
+#ifdef CONFIG_DEVICE_XCOPY
+	{Opt_device_copy, "device_copy"},
+	{Opt_no_device_copy, "no_device_copy"},
+#endif
 	{Opt_gc_merge, "gc_merge"},
 	{Opt_nogc_merge, "nogc_merge"},
 	{Opt_err, NULL},
@@ -299,10 +311,10 @@ static void f2fs_destroy_casefold_cache(void) { }
 
 static inline void limit_reserve_root(struct f2fs_sb_info *sbi)
 {
-	block_t limit = min((sbi->user_block_count << 1) / 1000,
+	block_t limit = min((sbi->user_block_count >> 3),
 			sbi->user_block_count - sbi->reserved_blocks);
 
-	/* limit is 0.2% */
+	/* limit is 12.5% */
 	if (test_opt(sbi, RESERVE_ROOT) &&
 			F2FS_OPTION(sbi).root_reserved_blocks > limit) {
 		F2FS_OPTION(sbi).root_reserved_blocks = limit;
@@ -1142,6 +1154,14 @@ static int parse_options(struct super_block *sb, char *options, bool is_remount)
 		case Opt_atgc:
 			set_opt(sbi, ATGC);
 			break;
+#ifdef CONFIG_DEVICE_XCOPY
+		case Opt_device_copy:
+			set_opt(sbi, DEVICE_COPY);
+			break;
+		case Opt_no_device_copy:
+			clear_opt(sbi, DEVICE_COPY);
+			break;
+#endif
 		case Opt_gc_merge:
 			set_opt(sbi, GC_MERGE);
 			break;
@@ -1259,7 +1279,9 @@ static struct inode *f2fs_alloc_inode(struct super_block *sb)
 	init_f2fs_rwsem(&fi->i_gc_rwsem[WRITE]);
 	init_f2fs_rwsem(&fi->i_mmap_sem);
 	init_f2fs_rwsem(&fi->i_xattr_sem);
-
+#ifdef CONFIG_DEVICE_XCOPY
+	atomic_set(&fi->file_xcopy_cnt, 0);
+#endif
 	/* Will be used by directory only */
 	fi->i_dir_level = F2FS_SB(sb)->dir_level;
 
@@ -1555,14 +1577,17 @@ static int f2fs_freeze(struct super_block *sb)
 	if (is_sbi_flag_set(F2FS_SB(sb), SBI_IS_DIRTY))
 		return -EINVAL;
 
-	/* ensure no checkpoint required */
-	if (!llist_empty(&F2FS_SB(sb)->cprc_info.issue_list))
-		return -EINVAL;
+	/* Let's flush checkpoints and stop the thread. */
+	f2fs_flush_ckpt_thread(F2FS_SB(sb));
+
+	/* to avoid deadlock on f2fs_evict_inode->SB_FREEZE_FS */
+	set_sbi_flag(F2FS_SB(sb), SBI_IS_FREEZING);
 	return 0;
 }
 
 static int f2fs_unfreeze(struct super_block *sb)
 {
+	clear_sbi_flag(F2FS_SB(sb), SBI_IS_FREEZING);
 	return 0;
 }
 
@@ -1891,6 +1916,12 @@ static int f2fs_show_options(struct seq_file *seq, struct dentry *root)
 
 	if (test_opt(sbi, ATGC))
 		seq_puts(seq, ",atgc");
+#ifdef CONFIG_DEVICE_XCOPY
+	if (test_opt(sbi, DEVICE_COPY))
+		seq_puts(seq, ",device_copy");
+	else
+		seq_puts(seq, ",no_device_copy");
+#endif
 	return 0;
 }
 
@@ -1915,7 +1946,9 @@ static void default_options(struct f2fs_sb_info *sbi)
 	F2FS_OPTION(sbi).bggc_mode = BGGC_MODE_ON;
 
 	sbi->sb->s_flags &= ~SB_INLINECRYPT;
-
+#ifdef CONFIG_DEVICE_XCOPY
+	set_opt(sbi, DEVICE_COPY);
+#endif
 	set_opt(sbi, INLINE_XATTR);
 	set_opt(sbi, INLINE_DATA);
 	set_opt(sbi, INLINE_DENTRY);
@@ -2025,6 +2058,9 @@ static void f2fs_enable_checkpoint(struct f2fs_sb_info *sbi)
 	f2fs_up_write(&sbi->gc_lock);
 
 	f2fs_sync_fs(sbi->sb, 1);
+
+	/* Let's ensure there's no pending checkpoint anymore */
+	f2fs_flush_ckpt_thread(sbi);
 }
 
 static int f2fs_remount(struct super_block *sb, int *flags, char *data)
@@ -2184,6 +2220,9 @@ static int f2fs_remount(struct super_block *sb, int *flags, char *data)
 		f2fs_stop_ckpt_thread(sbi);
 		need_restart_ckpt = true;
 	} else {
+		/* Flush if the prevous checkpoint, if exists. */
+		f2fs_flush_ckpt_thread(sbi);
+
 		err = f2fs_start_ckpt_thread(sbi);
 		if (err) {
 			f2fs_err(sbi,
@@ -2539,7 +2578,8 @@ int f2fs_quota_sync(struct super_block *sb, int type)
 		if (!sb_has_quota_active(sb, cnt))
 			continue;
 
-		inode_lock(dqopt->files[cnt]);
+		if (!f2fs_sb_has_quota_ino(sbi))
+			inode_lock(dqopt->files[cnt]);
 
 		/*
 		 * do_quotactl
@@ -2558,7 +2598,8 @@ int f2fs_quota_sync(struct super_block *sb, int type)
 		f2fs_up_read(&sbi->quota_sem);
 		f2fs_unlock_op(sbi);
 
-		inode_unlock(dqopt->files[cnt]);
+		if (!f2fs_sb_has_quota_ino(sbi))
+			inode_unlock(dqopt->files[cnt]);
 
 		if (ret)
 			break;
@@ -3420,6 +3461,10 @@ static void init_sb_info(struct f2fs_sb_info *sbi)
 	sbi->interval_time[DISABLE_TIME] = DEF_DISABLE_INTERVAL;
 	sbi->interval_time[UMOUNT_DISCARD_TIMEOUT] =
 				DEF_UMOUNT_DISCARD_TIMEOUT;
+#ifdef CONFIG_DEVICE_XCOPY
+	sbi->device_copy_enable = f2fs_enable_device_copy(sbi);
+#endif
+
 	clear_sbi_flag(sbi, SBI_NEED_FSCK);
 
 	for (i = 0; i < NR_COUNT_TYPE; i++)
@@ -3631,6 +3676,26 @@ int f2fs_commit_super(struct f2fs_sb_info *sbi, bool recover)
 	return err;
 }
 
+void f2fs_handle_stop(struct f2fs_sb_info *sbi, unsigned char reason)
+{
+	struct f2fs_super_block *raw_super = F2FS_RAW_SUPER(sbi);
+	int err;
+
+	f2fs_bug_on(sbi, reason >= MAX_STOP_REASON);
+
+	f2fs_down_write(&sbi->sb_lock);
+
+	if (raw_super->s_stop_reason[reason] < ((1 << BITS_PER_BYTE) - 1))
+		raw_super->s_stop_reason[reason]++;
+
+	err = f2fs_commit_super(sbi, false);
+	if (err)
+		f2fs_err(sbi, "f2fs_commit_super fails to record reason:%u err:%d",
+								reason, err);
+
+	f2fs_up_write(&sbi->sb_lock);
+}
+
 static int f2fs_scan_devices(struct f2fs_sb_info *sbi)
 {
 	struct f2fs_super_block *raw_super = F2FS_RAW_SUPER(sbi);
@@ -3771,7 +3836,8 @@ static void f2fs_tuning_parameters(struct f2fs_sb_info *sbi)
 	if (sm_i->main_segments <= SMALL_VOLUME_SEGMENTS) {
 		F2FS_OPTION(sbi).alloc_mode = ALLOC_MODE_REUSE;
 		sm_i->dcc_info->discard_granularity = 1;
-		sm_i->ipu_policy = 1 << F2FS_IPU_FORCE;
+		sm_i->ipu_policy = 1 << F2FS_IPU_FORCE |
+					1 << F2FS_IPU_HONOR_OPU_WRITE;
 	}
 
 	sbi->readdir_ra = 1;

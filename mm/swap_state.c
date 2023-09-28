@@ -161,7 +161,9 @@ int add_to_swap_cache(struct page *page, swp_entry_t entry,
 			xas_store(&xas, page);
 			xas_next(&xas);
 		}
+#ifndef CONFIG_CONT_PTE_HUGEPAGE
 		address_space->nrexceptional -= nr_shadows;
+#endif
 		address_space->nrpages += nr;
 		__mod_node_page_state(page_pgdat(page), NR_FILE_PAGES, nr);
 		ADD_CACHE_INFO(add_total, nr);
@@ -200,8 +202,10 @@ void __delete_from_swap_cache(struct page *page,
 		xas_next(&xas);
 	}
 	ClearPageSwapCache(page);
+#ifndef CONFIG_CONT_PTE_HUGEPAGE
 	if (shadow)
 		address_space->nrexceptional += nr;
+#endif
 	address_space->nrpages -= nr;
 	__mod_node_page_state(page_pgdat(page), NR_FILE_PAGES, -nr);
 	ADD_CACHE_INFO(del_total, nr);
@@ -302,7 +306,9 @@ void clear_shadow_from_swap_cache(int type, unsigned long begin,
 			xas_store(&xas, NULL);
 			nr_shadows++;
 		}
+#ifndef CONFIG_CONT_PTE_HUGEPAGE
 		address_space->nrexceptional -= nr_shadows;
+#endif
 		xa_unlock_irq(&address_space->i_pages);
 
 		/* search the next swapcache until we meet end */

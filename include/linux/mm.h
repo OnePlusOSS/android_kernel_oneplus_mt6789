@@ -44,6 +44,10 @@ struct writeback_control;
 struct bdi_writeback;
 struct pt_regs;
 
+#if defined(CONFIG_CONT_PTE_HUGEPAGE)
+#define may_cont_pte android_kabi_reserved1 /*struct inode*/
+#endif
+
 extern int sysctl_page_lock_unfairness;
 
 void init_mm_internals(void);
@@ -845,6 +849,8 @@ static inline void *kvcalloc(size_t n, size_t size, gfp_t flags)
 	return kvmalloc_array(n, size, flags | __GFP_ZERO);
 }
 
+extern void *kvrealloc(const void *p, size_t oldsize, size_t newsize,
+		gfp_t flags);
 extern void kvfree(const void *addr);
 extern void kvfree_sensitive(const void *addr, size_t len);
 
@@ -953,6 +959,12 @@ static inline void set_compound_page_dtor(struct page *page,
 
 static inline void destroy_compound_page(struct page *page)
 {
+#ifdef CONFIG_CONT_PTE_HUGEPAGE
+#define PG_cont (__NR_PAGEFLAGS + 4)
+#define PageCont(page) test_bit(PG_cont, &(page)->flags)
+	BUG_ON(PageCont(page) && !PageError(page) && !PageUptodate(page));
+#endif
+
 	VM_BUG_ON_PAGE(page[1].compound_dtor >= NR_COMPOUND_DTORS, page);
 	compound_page_dtors[page[1].compound_dtor](page);
 }
@@ -1758,6 +1770,12 @@ int generic_access_phys(struct vm_area_struct *vma, unsigned long addr,
 #ifdef CONFIG_SPECULATIVE_PAGE_FAULT
 static inline void vm_write_begin(struct vm_area_struct *vma)
 {
+        /*
+         * Isolated vma might be freed without exclusive mmap_lock but
+         * speculative page fault handler still needs to know it was changed.
+         */
+        if (!RB_EMPTY_NODE(&vma->vm_rb))
+	       mmap_assert_write_locked(vma->vm_mm);
 	/*
 	 * The reads never spins and preemption
 	 * disablement is not required.
@@ -2735,6 +2753,7 @@ extern int install_special_mapping(struct mm_struct *mm,
 				   unsigned long flags, struct page **pages);
 
 unsigned long randomize_stack_top(unsigned long stack_top);
+unsigned long randomize_page(unsigned long start, unsigned long range);
 
 extern unsigned long get_unmapped_area(struct file *, unsigned long, unsigned long, unsigned long, unsigned long);
 
@@ -3394,6 +3413,282 @@ static inline int seal_check_future_write(int seals, struct vm_area_struct *vma)
 
 	return 0;
 }
+
+#ifdef CONFIG_CONT_PTE_HUGEPAGE
+#define CONFIG_CONT_PTE_HUGEPAGE_DEBUG	1
+#define CONFIG_CONT_PTE_FAULT_AROUND	1
+#define EROFS_IOERROR_INJECTION		0
+
+#define HPAGE_CONT_PTE_SHIFT	CONT_PTE_SHIFT
+#define HPAGE_CONT_PTE_ORDER	(CONT_PTE_SHIFT-PAGE_SHIFT)
+#define HPAGE_CONT_PTE_SIZE	CONT_PTE_SIZE
+#define HPAGE_CONT_PTE_MASK	CONT_PTE_MASK
+#define HPAGE_CONT_PTE_NR	CONT_PTES
+
+#define ALIGN_UP(x, align_to) (((x) + ((align_to)-1)) & ~((align_to)-1))
+
+/* look_around use +1, ksrhink_lruvecd uses +2/+3 */
+#define PG_cont (__NR_PAGEFLAGS + 4)
+#define PG_cont_uptodate (PG_cont + 1)
+#define PG_cont_iodoing (PG_cont + 2)
+#define PG_cont_ioredo_s (PG_cont + 3)
+#define PG_cont_ioredo_e (PG_cont + 5)
+
+#define PageCont(page) test_bit(PG_cont, &(page)->flags)
+#define SetPageCont(page) set_bit(PG_cont, &(page)->flags)
+#define ClearPageCont(page) clear_bit(PG_cont, &(page)->flags)
+#define TestClearPageCont(page) test_and_clear_bit(PG_cont, &(page)->flags)
+
+#define PageContUptodate(page) test_bit(PG_cont_uptodate, &(page)->flags)
+#define SetPageContUptodate(page) set_bit(PG_cont_uptodate, &(page)->flags)
+#define ClearPageContUptodate(page) clear_bit(PG_cont_uptodate, &(page)->flags)
+#define TestClearPageContUptodate(page) test_and_clear_bit(PG_cont_uptodate, &(page)->flags)
+
+#define PageContIODoing(page) test_bit(PG_cont_iodoing, &(page)->flags)
+#define SetPageContIODoing(page) set_bit(PG_cont_iodoing, &(page)->flags)
+#define ClearPageContIODoing(page) clear_bit(PG_cont_iodoing, &(page)->flags)
+#define TestClearPageContIODoing(page) test_and_clear_bit(PG_cont_iodoing, &(page)->flags)
+#define TestSetPageContIODoing(page) test_and_set_bit(PG_cont_iodoing, &(page)->flags)
+
+#define SetPageHead(page) set_bit(PG_head, &(page)->flags)
+
+#define NORMAL_HUGE	1
+#define JAR_HUGE	2
+
+/* enum fault_flag, in case mainline is going to use 11-14 */
+#define FAULT_FLAG_CONT_PTE	(1 << 15)
+
+#define HIT_THP		0
+#define HIT_CONT	1
+#define HIT_BASEPAGE	2
+#define HIT_NOTHING	3
+
+extern atomic_long_t cont_pte_double_map_count;
+
+static inline bool transhuge_cont_pte_addr_suitable(struct vm_area_struct *vma,
+						    unsigned long haddr)
+{
+	return ((haddr >= vma->vm_start) && (haddr + HPAGE_CONT_PTE_SIZE <= vma->vm_end));
+}
+
+static inline bool transhuge_cont_pte_vma_aligned(struct vm_area_struct *vma)
+{
+	return IS_ALIGNED((vma->vm_start >> PAGE_SHIFT) - vma->vm_pgoff, HPAGE_CONT_PTE_NR);
+
+}
+
+extern inline bool transhuge_cont_pte_vma_suitable(struct vm_area_struct *vma,
+						   unsigned long haddr);
+
+#define cont_ptep_clear_flush_young_notify(__vma, __address, __ptep)	\
+({									\
+	int __young = 0;						\
+	unsigned long i;						\
+	struct vm_area_struct *___vma = __vma;				\
+	unsigned long ___address = __address & HPAGE_CONT_PTE_MASK;	\
+	for (i = 0; i < HPAGE_CONT_PTE_NR; i++)				\
+		__young |= ptep_test_and_clear_young(___vma,		\
+						    ___address +	\
+						    i * PAGE_SIZE,	\
+						    __ptep + i);	\
+	__young |= mmu_notifier_clear_flush_young(___vma->vm_mm,	\
+						___address,		\
+						___address +		\
+						HPAGE_CONT_PTE_SIZE);	\
+	__young;							\
+})
+
+#define cont_ptep_clear_flush_young_full(__vma, __address, __ptep)	\
+({									\
+	int __young = 0;						\
+	unsigned long i;						\
+	struct vm_area_struct *___vma = __vma;				\
+	unsigned long ___address = __address & HPAGE_CONT_PTE_MASK;	\
+	for (i = 0; i < HPAGE_CONT_PTE_NR; i++)				\
+		__young |= ptep_test_and_clear_young(___vma,		\
+						    ___address +	\
+						    i * PAGE_SIZE,	\
+						    __ptep + i);	\
+	if (__young)							\
+		flush_tlb_range(___vma, ___address,			\
+			___address + HPAGE_CONT_PTE_SIZE);		\
+})
+
+static inline bool cont_pte_none(pte_t *ptep)
+{
+	int i;
+
+	for (i = 0; i < HPAGE_CONT_PTE_NR; i++) {
+		if (!pte_none(*(ptep + i)))
+			return false;
+	}
+
+	return true;
+}
+
+static inline bool cont_pte_trans_huge(pte_t *ptep)
+{
+	int i;
+
+	for (i = 0; i < HPAGE_CONT_PTE_NR; i++) {
+		if (!pte_cont(*(ptep + i)))
+			return false;
+	}
+
+	return true;
+}
+
+static inline bool ContPteHugePageHead(struct page *page)
+{
+	if (PageTail(page))
+		return false;
+
+	return PageTransHuge(page)
+	    && compound_order(page) == HPAGE_CONT_PTE_ORDER
+	    && is_transparent_hugepage(page);
+
+}
+
+/**
+ * cont_pte_nr_pages - The number of regular pages in this cont-pte hugepage.
+ * @page: The head page of a cont-pte hugepage.
+ *  NOTE: use injudiciously!
+ */
+static inline int cont_pte_nr_pages(struct page *page)
+{
+	VM_BUG_ON_PGFLAGS(PageTail(page), page);
+	if (PageHead(page)) {
+		return page[1].compound_nr;
+	} else if (PageCont(page)) {
+		BUG_ON(!IS_ALIGNED(page_to_pfn(page), HPAGE_CONT_PTE_NR));
+		return HPAGE_CONT_PTE_NR;
+	}
+
+	return 1;
+}
+
+static inline bool ContPteHugePage(struct page *page)
+{
+	return PageTransCompound(page)
+	    && compound_order(compound_head(page)) == HPAGE_CONT_PTE_ORDER
+	    && is_transparent_hugepage(page);
+}
+
+/*
+ * huge file pages for .so, .oat. .odex in erofs are mapped massively, they are likely
+ * to be hot
+ */
+static inline bool ContPteHugePageSkipMassiveMapped(struct page *page)
+{
+	if (page && PageCont(page) && PageHead(page) && atomic_read(&page->_mapcount) > 20) {
+		/*
+		 * try to slow down the rmap for massively mapped hugepages, but we
+		 * still scan them so that they can be reclaimed if they are really
+		 * cold. skip 3/4 rmap.
+		 */
+		static int scan_pos;
+
+		return (scan_pos++ % 4) != 0;
+	}
+
+	return false;
+}
+
+/* NOTE: We must already hold page lock for header page */
+static inline bool ContPteHugePageDoubleMap(struct page *page)
+{
+	int i;
+	struct page *head = compound_head(page);
+
+	BUG_ON(!PageLocked(head));
+	if (!PageDoubleMap(head))
+		return false;
+
+	for (i = 0; i < HPAGE_CONT_PTE_NR; i++) {
+		if (atomic_read(&head[i]._mapcount) !=
+		    atomic_read(compound_mapcount_ptr(head)))
+			return true;
+	}
+
+	if (TestClearPageDoubleMap(page))
+		atomic_long_dec(&cont_pte_double_map_count);
+
+	return false;
+}
+
+extern struct cma *cont_pte_cma;
+
+extern inline bool within_cont_pte_cma(unsigned long pfn);
+extern inline bool is_cont_pte_cma(struct cma *cma);
+
+static inline int vmf_may_cont_pte(struct vm_fault *vmf)
+{
+	struct file *file = vmf->vma->vm_file;
+	struct address_space *mapping = file ? file->f_mapping : NULL;
+	struct inode *inode = mapping ? mapping->host : NULL;
+
+	return inode ? inode->may_cont_pte : false;
+}
+
+#define cont_pte_pagefault_dump(vmf, reason) do { \
+	struct vm_area_struct *vma = vmf->vma; \
+	const char *name = vma->vm_file->f_path.dentry ? (const char *)vma->vm_file->f_path.dentry->d_name.name : "NULL"; \
+															\
+	pr_debug("%s %s %d: filename:%s inode:%ld process:%s aligned:%d index:%lx-%lx vm_pgoff:%lx vma:%lx-%lx r:%d w:%d x:%d mw:%d flags:%lx\n", \
+			reason, __func__, __LINE__, name, vma->vm_file->f_inode->i_ino,  current->comm, transhuge_cont_pte_vma_aligned(vma), \
+			vmf->page ? vmf->page->index : -1UL, vmf->pgoff, vma->vm_pgoff, (unsigned long)vma->vm_start, (unsigned long)vma->vm_end, \
+			!!(vma->vm_flags & VM_READ), !!(vma->vm_flags & VM_WRITE), !!(vma->vm_flags & VM_EXEC), \
+			!!(vma->vm_flags & VM_MAYWRITE), vma->vm_flags);\
+	} while (0)
+
+extern unsigned long cont_pte_cma_size;
+
+extern inline bool cont_pte_huge_page_enabled(void);
+
+extern pte_t cont_pte_huge_ptep_get_and_clear(struct mm_struct *mm,
+					      unsigned long addr, pte_t *ptep);
+
+extern pte_t cont_pte_huge_ptep_get_and_clear_flush(struct mm_struct *mm,
+					      unsigned long addr, pte_t *ptep);
+
+extern void __split_huge_cont_pte(struct vm_area_struct *vma, pte_t *pte,
+				  unsigned long address, bool freeze,
+				  struct page *page);
+
+extern void change_huge_cont_pte(struct vm_area_struct *vma, pte_t *pte,
+				 unsigned long addr, pgprot_t newprot,
+				 unsigned long cp_flags);
+
+extern void split_huge_cont_pte_address(struct vm_area_struct *vma,
+					unsigned long address, bool freeze,
+					struct page *page);
+
+extern int find_get_cont_pte_pages(struct address_space *mapping, pgoff_t start,
+				   struct page **ret_page);
+
+extern struct page *find_get_entry_may_cont_pte(struct address_space *mapping,
+		pgoff_t index);
+
+extern struct file *do_cont_pte_sync_mmap_readahead(struct vm_fault *vmf);
+
+extern struct file *do_cont_pte_async_mmap_readahead(struct vm_fault *vmf, struct page *page);
+
+extern void do_set_cont_pte(struct vm_fault *vmf, struct page *page);
+
+extern void do_set_cont_pte_with_addr(struct vm_fault *vmf,
+				struct page *page,
+				unsigned long addr);
+
+extern void set_cont_pte_uptodate_and_unlock(struct page *page);
+
+extern void init_cont_endio_spinlock(struct inode *inode);
+
+extern int read_huge_page_pool_pages(void);
+
+extern bool huge_page_pool_refill(struct page *page);
+
+vm_fault_t cont_pte_filemap_around(struct vm_fault *vmf, pgoff_t start_pgoff, pgoff_t end_pgoff);
+#endif /* CONFIG_CONT_PTE_HUGEPAGE */
 
 #endif /* __KERNEL__ */
 #endif /* _LINUX_MM_H */

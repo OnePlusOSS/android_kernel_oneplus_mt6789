@@ -424,6 +424,12 @@ static int stat_show(struct seq_file *s, void *v)
 			   si->curseg[CURSEG_ALL_DATA_ATGC],
 			   si->cursec[CURSEG_ALL_DATA_ATGC],
 			   si->curzone[CURSEG_ALL_DATA_ATGC]);
+#ifdef CONFIG_DEVICE_XCOPY
+		seq_printf(s, "  - COPY   data: %8d %8d %8d\n",
+			   si->curseg[CURSEG_COLD_DATA_COPY],
+			   si->cursec[CURSEG_COLD_DATA_COPY],
+			   si->curzone[CURSEG_COLD_DATA_COPY]);
+#endif
 		seq_printf(s, "\n  - Valid: %d\n  - Dirty: %d\n",
 			   si->main_area_segs - si->dirty_count -
 			   si->prefree_count - si->free_segs,
@@ -576,6 +582,16 @@ int f2fs_build_stats(struct f2fs_sb_info *sbi)
 	si->main_area_sections = le32_to_cpu(raw_super->section_count);
 	si->main_area_zones = si->main_area_sections /
 				le32_to_cpu(raw_super->secs_per_zone);
+
+#ifdef CONFIG_DEVICE_XCOPY
+	si->xcopy_defragment_blks = 0;
+	si->xcopy_count = 0;
+	si->time_snap = 0;
+	si->time_cost_max_defrag = 0;
+	si->time_cost_aver_defrag = 0;
+	si->total_fail_cnt = 0;
+#endif
+
 	si->sbi = sbi;
 	sbi->stat_info = si;
 

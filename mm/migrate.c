@@ -56,6 +56,11 @@
 #include <trace/events/migrate.h>
 #undef CREATE_TRACE_POINTS
 #include <trace/hooks/mm.h>
+#include <trace/hooks/vmscan.h>
+
+#undef CREATE_TRACE_POINTS
+#include <trace/hooks/mm.h>
+#include <trace/hooks/vmscan.h>
 
 #include "internal.h"
 
@@ -303,6 +308,9 @@ void __migration_entry_wait(struct mm_struct *mm, pte_t *ptep,
 		goto out;
 
 	page = migration_entry_to_page(entry);
+#ifdef CONFIG_CONT_PTE_HUGEPAGE
+	BUG_ON(PageCont(page));
+#endif
 	page = compound_head(page);
 
 	/*
@@ -606,6 +614,9 @@ void migrate_page_states(struct page *newpage, struct page *page)
 		SetPageChecked(newpage);
 	if (PageMappedToDisk(page))
 		SetPageMappedToDisk(newpage);
+	trace_android_vh_look_around_migrate_page(page, newpage);
+
+	trace_android_vh_look_around_migrate_page(page, newpage);
 
 	/* Move dirty on pages not done by migrate_page_move_mapping() */
 	if (PageDirty(page))
@@ -990,9 +1001,12 @@ static int move_to_new_page(struct page *newpage, struct page *page,
 		if (!PageMappingFlags(page))
 			page->mapping = NULL;
 
-		if (likely(!is_zone_device_page(newpage)))
-			flush_dcache_page(newpage);
+		if (likely(!is_zone_device_page(newpage))) {
+			int i, nr = compound_nr(newpage);
 
+			for (i = 0; i < nr; i++)
+				flush_dcache_page(newpage + i);
+		}
 	}
 out:
 	return rc;
@@ -1028,6 +1042,11 @@ static int __unmap_and_move(struct page *page, struct page *newpage,
 
 		lock_page(page);
 	}
+
+	/* for debugging, detect the migration of subpages */
+#ifdef CONFIG_CONT_PTE_HUGEPAGE
+	BUG_ON(PageCont(page));
+#endif
 
 	if (PageWriteback(page)) {
 		/*
@@ -2454,12 +2473,13 @@ next:
 		migrate->dst[migrate->npages] = 0;
 		migrate->src[migrate->npages++] = mpfn;
 	}
-	arch_leave_lazy_mmu_mode();
-	pte_unmap_unlock(ptep - 1, ptl);
 
 	/* Only flush the TLB if we actually modified any entries */
 	if (unmapped)
 		flush_tlb_range(walk->vma, start, end);
+
+	arch_leave_lazy_mmu_mode();
+	pte_unmap_unlock(ptep - 1, ptl);
 
 	return 0;
 }

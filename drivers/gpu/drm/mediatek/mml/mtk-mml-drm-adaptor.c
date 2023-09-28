@@ -634,6 +634,7 @@ static void task_frame_done(struct mml_task *task)
 			cfg->run_task_cnt,
 			cfg->done_task_cnt,
 			task->state);
+		task->err = true;
 		kref_put(&task->ref, task_move_to_destroy);
 	} else {
 		/* works fine, safe to move */

@@ -918,6 +918,8 @@ static void mtk_cam_exception_work(struct work_struct *work)
 #else
 	WARN_ON(1);
 #endif
+    if(dbg_work->smi_dump)
+        mtk_smi_dbg_hang_detect("camsys");
 
 	atomic_set(&dbg_work->state, MTK_CAM_REQ_DBGWORK_S_FINISHED);
 }
@@ -1116,6 +1118,21 @@ mtk_cam_debug_detect_dequeue_failed(struct mtk_cam_request_stream_data *s_data,
 			 s_data->frame_seq_no, s_data->state.estate, irq_info->ts_ns / 1000);
 		}
 	}
+#ifdef OPLUS_FEATURE_CAMERA_COMMON
+	/*extisp debug dump case*/
+	if (s_data->state.estate == E_STATE_EXTISP_OUTER ||
+	    s_data->state.estate == E_STATE_EXTISP_INNER) {
+		s_data->no_frame_done_cnt++;
+		if (s_data->no_frame_done_cnt > 1) {
+			dev_info(ctx->cam->dev,
+			 "%s:EXTISP-SOF[ctx:%d-#%d] no p1 done for %d sofs, FBC_CNT %d dump req(%d) state(%d) ts(%lu)\n",
+			 req->req.debug_str, ctx->stream_id,
+			 ctx->dequeued_frame_seq_no,
+			 s_data->no_frame_done_cnt, irq_info->fbc_cnt,
+			 s_data->frame_seq_no, s_data->state.estate, irq_info->ts_ns / 1000);
+		}
+	}
+#endif
 	if (s_data->no_frame_done_cnt >= NO_P1_DONE_DEBUG_START) {
 		dev_info(raw_dev->dev,
 			 "INT_EN %x\n",

@@ -33,7 +33,7 @@
 #include <linux/oom.h>
 #include <linux/numa.h>
 #include <linux/page_owner.h>
-
+#include <trace/hooks/mm.h>
 #include <asm/tlb.h>
 #include <asm/pgalloc.h>
 #include "internal.h"
@@ -47,11 +47,17 @@
  * for all hugepage allocations.
  */
 unsigned long transparent_hugepage_flags __read_mostly =
+#ifndef CONFIG_CONT_PTE_HUGEPAGE
+	/* XXX:
+	 * cont_pte is thp-like and api compatible with thp, but it doesn't
+	 * require collapse and doesn't co-work with collapse either
+	 */
 #ifdef CONFIG_TRANSPARENT_HUGEPAGE_ALWAYS
 	(1<<TRANSPARENT_HUGEPAGE_FLAG)|
 #endif
 #ifdef CONFIG_TRANSPARENT_HUGEPAGE_MADVISE
 	(1<<TRANSPARENT_HUGEPAGE_REQ_MADV_FLAG)|
+#endif
 #endif
 	(1<<TRANSPARENT_HUGEPAGE_DEFRAG_REQ_MADV_FLAG)|
 	(1<<TRANSPARENT_HUGEPAGE_DEFRAG_KHUGEPAGED_FLAG)|
@@ -188,7 +194,8 @@ static ssize_t enabled_store(struct kobject *kobj,
 			     const char *buf, size_t count)
 {
 	ssize_t ret = count;
-
+	/* Read XXX */
+#ifndef CONFIG_CONT_PTE_HUGEPAGE
 	if (sysfs_streq(buf, "always")) {
 		clear_bit(TRANSPARENT_HUGEPAGE_REQ_MADV_FLAG, &transparent_hugepage_flags);
 		set_bit(TRANSPARENT_HUGEPAGE_FLAG, &transparent_hugepage_flags);
@@ -206,6 +213,7 @@ static ssize_t enabled_store(struct kobject *kobj,
 		if (err)
 			ret = err;
 	}
+#endif
 	return ret;
 }
 static struct kobj_attribute enabled_attr =
@@ -450,6 +458,8 @@ static int __init setup_transparent_hugepage(char *str)
 	int ret = 0;
 	if (!str)
 		goto out;
+	/* Read XXX */
+#ifndef CONFIG_CONT_PTE_HUGEPAGE
 	if (!strcmp(str, "always")) {
 		set_bit(TRANSPARENT_HUGEPAGE_FLAG,
 			&transparent_hugepage_flags);
@@ -469,6 +479,7 @@ static int __init setup_transparent_hugepage(char *str)
 			  &transparent_hugepage_flags);
 		ret = 1;
 	}
+#endif
 out:
 	if (!ret)
 		pr_warn("transparent_hugepage= cannot parse, ignored\n");
@@ -1481,7 +1492,7 @@ vm_fault_t do_huge_pmd_numa_page(struct vm_fault *vmf, pmd_t pmd)
 	 */
 	get_page(page);
 	spin_unlock(vmf->ptl);
-	anon_vma = page_lock_anon_vma_read(page);
+	anon_vma = page_lock_anon_vma_read(page, NULL);
 
 	/* Confirm the PMD did not change while page_table_lock was released */
 	spin_lock(vmf->ptl);
@@ -1691,7 +1702,7 @@ int zap_huge_pmd(struct mmu_gather *tlb, struct vm_area_struct *vma,
 
 			VM_BUG_ON(!is_pmd_migration_entry(orig_pmd));
 			entry = pmd_to_swp_entry(orig_pmd);
-			page = pfn_to_page(swp_offset(entry));
+			page = migration_entry_to_page(entry);
 			flush_needed = 0;
 		} else
 			WARN_ONCE(1, "Non present huge pmd without pmd migration enabled!");
@@ -2033,6 +2044,7 @@ static void __split_huge_pmd_locked(struct vm_area_struct *vma, pmd_t *pmd,
 	bool young, write, soft_dirty, pmd_migration = false, uffd_wp = false;
 	unsigned long addr;
 	int i;
+	bool success = false;
 
 	VM_BUG_ON(haddr & ~HPAGE_PMD_MASK);
 	VM_BUG_ON_VMA(vma->vm_start > haddr, vma);
@@ -2110,7 +2122,7 @@ static void __split_huge_pmd_locked(struct vm_area_struct *vma, pmd_t *pmd,
 		swp_entry_t entry;
 
 		entry = pmd_to_swp_entry(old_pmd);
-		page = pfn_to_page(swp_offset(entry));
+		page = migration_entry_to_page(entry);
 		write = is_write_migration_entry(entry);
 		young = false;
 		soft_dirty = pmd_swp_soft_dirty(old_pmd);
@@ -2164,8 +2176,12 @@ static void __split_huge_pmd_locked(struct vm_area_struct *vma, pmd_t *pmd,
 		pte = pte_offset_map(&_pmd, addr);
 		BUG_ON(!pte_none(*pte));
 		set_pte_at(mm, addr, pte, entry);
-		if (!pmd_migration)
-			atomic_inc(&page[i]._mapcount);
+		if (!pmd_migration) {
+			trace_android_vh_update_page_mapcount(&page[i], true,
+						false, NULL, &success);
+			if (!success)
+				atomic_inc(&page[i]._mapcount);
+		}
 		pte_unmap(pte);
 	}
 
@@ -2176,8 +2192,12 @@ static void __split_huge_pmd_locked(struct vm_area_struct *vma, pmd_t *pmd,
 		 */
 		if (compound_mapcount(page) > 1 &&
 		    !TestSetPageDoubleMap(page)) {
-			for (i = 0; i < HPAGE_PMD_NR; i++)
-				atomic_inc(&page[i]._mapcount);
+			for (i = 0; i < HPAGE_PMD_NR; i++) {
+				trace_android_vh_update_page_mapcount(&page[i], true,
+								false, NULL, &success);
+				if (!success)
+					atomic_inc(&page[i]._mapcount);
+			}
 		}
 
 		lock_page_memcg(page);
@@ -2186,8 +2206,12 @@ static void __split_huge_pmd_locked(struct vm_area_struct *vma, pmd_t *pmd,
 			__dec_lruvec_page_state(page, NR_ANON_THPS);
 			if (TestClearPageDoubleMap(page)) {
 				/* No need in mapcount reference anymore */
-				for (i = 0; i < HPAGE_PMD_NR; i++)
-					atomic_dec(&page[i]._mapcount);
+				for (i = 0; i < HPAGE_PMD_NR; i++) {
+					trace_android_vh_update_page_mapcount(&page[i],
+							false, false, NULL, &success);
+					if (!success)
+						atomic_dec(&page[i]._mapcount);
+				}
 			}
 		}
 		unlock_page_memcg(page);
@@ -2348,6 +2372,50 @@ void vma_adjust_trans_huge(struct vm_area_struct *vma,
 			split_huge_pmd_address(next, nstart, false, NULL);
 	}
 }
+
+#ifdef CONFIG_CONT_PTE_HUGEPAGE
+void vma_adjust_cont_pte_trans_huge(struct vm_area_struct *vma,
+				    unsigned long start,
+				    unsigned long end,
+				    long adjust_next)
+{
+	/*
+	 * If the new start address isn't hpage aligned and it could
+	 * previously contain an hugepage: check if we need to split
+	 * an huge pmd.
+	 */
+	if (start & ~HPAGE_CONT_PTE_MASK &&
+	    (start & HPAGE_CONT_PTE_MASK) >= vma->vm_start &&
+	    (start & HPAGE_CONT_PTE_MASK) + HPAGE_CONT_PTE_SIZE <= vma->vm_end)
+		split_huge_cont_pte_address(vma, start, false, NULL);
+
+	/*
+	 * If the new end address isn't hpage aligned and it could
+	 * previously contain an hugepage: check if we need to split
+	 * an huge pmd.
+	 */
+	if (end & ~HPAGE_CONT_PTE_MASK &&
+	    (end & HPAGE_CONT_PTE_MASK) >= vma->vm_start &&
+	    (end & HPAGE_CONT_PTE_MASK) + HPAGE_CONT_PTE_SIZE <= vma->vm_end)
+		split_huge_cont_pte_address(vma, end, false, NULL);
+
+	/*
+	 * If we're also updating the vma->vm_next->vm_start, if the new
+	 * vm_next->vm_start isn't hpage aligned and it could previously
+	 * contain an hugepage: check if we need to split an huge pmd.
+	 */
+	if (adjust_next > 0) {
+		struct vm_area_struct *next = vma->vm_next;
+		unsigned long nstart = next->vm_start;
+
+		nstart += adjust_next;
+		if (nstart & ~HPAGE_CONT_PTE_MASK &&
+		    (nstart & HPAGE_CONT_PTE_MASK) >= next->vm_start &&
+		    (nstart & HPAGE_CONT_PTE_MASK) + HPAGE_CONT_PTE_SIZE <= next->vm_end)
+			split_huge_cont_pte_address(next, nstart, false, NULL);
+	}
+}
+#endif
 
 static void unmap_page(struct page *page)
 {

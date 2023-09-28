@@ -260,7 +260,7 @@ struct mtk_iommu_domain {
 static const struct iommu_ops mtk_iommu_ops;
 
 static bool pd_sta[MM_IOMMU_NUM];
-static spinlock_t tlb_locks[MM_IOMMU_NUM];
+static spinlock_t *tlb_locks[MM_IOMMU_NUM];
 static struct notifier_block mtk_pd_notifiers[MM_IOMMU_NUM];
 static bool hypmmu_type2_en;
 static struct mutex init_mutexs[PGTBALE_NUM];
@@ -1796,7 +1796,7 @@ static void mtk_iommu_iotlb_sync(struct iommu_domain *domain,
 		return;
 	}
 
-#if IS_ENABLED(CONFIG_MTK_IOMMU_MISC_DBG)
+#if IS_ENABLED(CONFIG_MTK_IOMMU_MISC_DBG) && IS_ENABLED(CONFIG_MTK_IOMMU_DEBUG)
 	if (gather->start > 0 && gather->start != ULONG_MAX)
 		mtk_iova_unmap(dom->tab_id, gather->start, length);
 #endif
@@ -1827,7 +1827,7 @@ static void mtk_iommu_sync_map(struct iommu_domain *domain, unsigned long iova,
 		return;
 	}
 
-#if IS_ENABLED(CONFIG_MTK_IOMMU_MISC_DBG)
+#if IS_ENABLED(CONFIG_MTK_IOMMU_MISC_DBG) && IS_ENABLED(CONFIG_MTK_IOMMU_DEBUG)
 	if (iova > 0 && iova != ULONG_MAX)
 		mtk_iova_map(dom->tab_id, iova, size);
 #endif
@@ -2119,14 +2119,14 @@ static int mtk_iommu_pd_callback(struct notifier_block *nb,
 {
 	unsigned long lock_flags;
 
-	spin_lock_irqsave(&tlb_locks[nb->priority], lock_flags);
+	spin_lock_irqsave(tlb_locks[nb->priority], lock_flags);
 
 	if (flags == GENPD_NOTIFY_ON)
 		pd_sta[nb->priority] = POWER_ON_STA;
 	else if (flags == GENPD_NOTIFY_PRE_OFF)
 		pd_sta[nb->priority] = POWER_OFF_STA;
 
-	spin_unlock_irqrestore(&tlb_locks[nb->priority], lock_flags);
+	spin_unlock_irqrestore(tlb_locks[nb->priority], lock_flags);
 
 	return NOTIFY_OK;
 }
@@ -2880,7 +2880,7 @@ skip_smi:
 		}
 
 		r = dev_pm_genpd_add_notifier(dev, &mtk_pd_notifiers[iommu_id]);
-		tlb_locks[iommu_id] = data->tlb_lock;
+		tlb_locks[iommu_id] = &data->tlb_lock;
 		pr_info("%s add_notifier dev:%s, disp_power_on:%d, iommu:%d\n",
 			__func__, dev_name(dev), disp_power_on, iommu_id);
 		if (r)
@@ -2925,8 +2925,7 @@ static int mtk_iommu_remove(struct platform_device *pdev)
 	iommu_device_sysfs_remove(&data->iommu);
 	iommu_device_unregister(&data->iommu);
 
-	if (iommu_present(&platform_bus_type))
-		bus_set_iommu(&platform_bus_type, NULL);
+	list_del(&data->list);
 
 	clk_disable_unprepare(data->bclk);
 	device_link_remove(data->smicomm_dev, &pdev->dev);
