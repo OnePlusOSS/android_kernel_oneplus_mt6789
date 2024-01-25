@@ -8264,7 +8264,8 @@ unsigned long long mtk_dsi_get_frame_hrt_bw_base_by_mode(
 			bw_base = DO_COMMON_DIV(bw_base * image_time, line_time);
 	}
 
-	if (panel_ext->params->oplus_more_frame_bw && vrefresh == 60)
+	if (panel_ext && panel_ext->params && panel_ext->params->oplus_more_frame_bw
+			&& vrefresh == 60)
 		bw_base = bw_base * 3 / 2;
 
 	DDPMSG("%s Frame Bw:%llu\n", __func__, bw_base);

@@ -136,9 +136,8 @@ struct lcm_fps_ctx_t lcm_fps_ctx[MAX_CRTC];
 
 static int manual_shift;
 static bool no_shift;
-bool shutingdown = false;
-EXPORT_SYMBOL(shutingdown);
-extern bool panel_is_bluey(void);
+int shut_down_flag = 0;
+EXPORT_SYMBOL(shut_down_flag);
 
 #ifdef DRM_OVL_SELF_PATTERN
 struct drm_crtc *test_crtc;
@@ -6539,6 +6538,9 @@ SKIP_SIDE_DISP:
 	if (ret)
 		goto err_pm;
 
+        if(shut_down_flag)
+                shut_down_flag = 0;
+
 	DDPINFO("%s-\n", __func__);
 
 	return 0;
@@ -6567,11 +6569,10 @@ static void mtk_drm_shutdown(struct platform_device *pdev)
 	struct mtk_drm_crtc *mtk_crtc;
 	struct mtk_ddp_comp *output_comp;
 	//#endif
+        shut_down_flag = 1;
 
 	if (drm) {
 		DDPMSG("%s\n", __func__);
-		if (panel_is_bluey())
-			shutingdown = true;
 		//#ifdef OPLUS_FEATURE_DISPLAY
 		if (mtkfb_set_backlight_level(0))
 			DDPMSG("%s, set panel backlight 0 failed!\n", __func__);

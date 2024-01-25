@@ -1377,7 +1377,9 @@ struct task_struct {
 	/* Please add your member in struct oplus_task_struct */
 	ANDROID_OEM_DATA_ARRAY(1, 32);
 
-	ANDROID_KABI_RESERVE(1);
+	/* PF_IO_WORKER */
+	ANDROID_KABI_USE(1, void *pf_io_worker);
+
 	ANDROID_KABI_RESERVE(2);
 	ANDROID_KABI_RESERVE(3);
 	ANDROID_KABI_RESERVE(4);

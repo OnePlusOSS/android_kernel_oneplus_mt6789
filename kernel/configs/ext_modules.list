@@ -4,7 +4,9 @@
 ../vendor/oplus/kernel/network/oplus_dns_hook
 ../vendor/oplus/kernel/network/oplus_qr_scan
 ../vendor/oplus/kernel/network/oplus_stats_calc
-../vendor/oplus/kernel/network/sk_pid_hook
+../vendor/oplus/kernel/network/linkpower_module
+../vendor/oplus/kernel/network/oplus_network_tuning
+../vendor/oplus/kernel/network/oplus_socket_stats_report
 ../vendor/oplus/kernel/network/oplus_apps_monitor
 ../vendor/oplus/kernel/network/oplus_game_first
 ../vendor/oplus/kernel/power/power_diag

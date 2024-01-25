@@ -5013,6 +5013,12 @@ retry:
 	if (current->flags & PF_MEMALLOC)
 		goto nopage;
 
+	trace_android_vh_alloc_pages_reclaim_bypass(gfp_mask, order,
+		alloc_flags, ac->migratetype, &page);
+
+	if (page)
+		goto got_pg;
+
 	/* Try direct reclaim and then allocating */
 	page = __alloc_pages_direct_reclaim(gfp_mask, order, alloc_flags, ac,
 							&did_some_progress);
@@ -5128,6 +5134,11 @@ nopage:
 		goto retry;
 	}
 fail:
+	trace_android_vh_alloc_pages_failure_bypass(gfp_mask, order,
+		alloc_flags, ac->migratetype, &page);
+	if (page)
+		goto got_pg;
+
 	warn_alloc(gfp_mask, ac->nodemask,
 			"page allocation failure: order:%u", order);
 got_pg:
@@ -5280,10 +5291,13 @@ static inline void free_the_page(struct page *page, unsigned int order)
 
 void __free_pages(struct page *page, unsigned int order)
 {
+	/* get PageHead before we drop reference */
+	int head = PageHead(page);
+
 	trace_android_vh_free_pages(page, order);
 	if (put_page_testzero(page))
 		free_the_page(page, order);
-	else if (!PageHead(page))
+	else if (!head)
 		while (order-- > 0)
 			free_the_page(page + (1 << order), order);
 }
